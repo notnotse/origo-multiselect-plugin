@@ -64,7 +64,9 @@ The optional argument to Multiselect is an object which can have the following p
 | pointBufferFactor  | How much a point should be buffered before intersecting when using click tool. Does not apply if active configuration is "All visible", as that uses featureInfo hitTolerance setting. | 1                       |
 | bufferSymbol       | Name of a symbol in origo configuration to use as symbol for buffered objects. Symbol is always a polygon.                                                                             | A built-in symbol       |
 | chooseSymbol       | Name of a symbol in origo configuration to use as symbol for highlighted features when choosing which feature to buffer. Symbol should handle point, line and polygon.                 | A built-in symbol       |
-| warnOnNoHits       | Whether an alert should be displayed when no features to select are found.                                                                                                             | `false`                 |                                                                                                                                           | `true`                  |
+| warnOnNoHits | Whether an alert should be displayed when no features to select are found. | `false` | | `true` |
+| WMSHandling        | How to query WMS layers. Set `{ source: 'WMS' }` to use GetFeatureInfo (inherits source params such as `CQL_FILTER`). If omitted, falls back to assuming a WFS endpoint at the same URL. | (legacy WFS-at-same-URL) |
+| alternativeLayers  | Array of per-layer query overrides (see below). Useful when a visible WMS layer should be queried via a hidden WFS layer, including copying `CQL_FILTER`.                               | `[]`                    |
 
 #### layerConfiguration
 A layerConfiguration specifies in which layers features are selected. The default behaviour is to select features in all currently visible
@@ -104,11 +106,59 @@ const selectableLayers = [
         ];
 ```
 
+#### alternativeLayers
+Overrides how Multiselect queries a specific layer (by Origo layer `name`). Typical use: visible WMS layer + hidden WFS query layer.
+
+| Property              | Description                                                                                                                                 | Required |
+|-----------------------|---------------------------------------------------------------------------------------------------------------------------------------------|----------|
+| name                  | Origo layer name of the selectable (often WMS) layer.                                                                                       | Yes      |
+| queryInfoLayers       | Array of Origo layer names to query instead (usually a non-visible WFS layer).                                                              | Yes*     |
+| disableFilterHandling | If `true`, do not copy the WMS layer's `CQL_FILTER` onto the query layer's Origo `filter`.                                                  | No       |
+
+\*If an entry matches but `queryInfoLayers` is missing or empty, that layer yields no hits.
+
+When filter handling is enabled (default), Multiselect resolves GeoServer `CQL_FILTER` from the WMS source params once at the server-query boundary and applies it as Origo `filter` on the query layer before `Origo.getFeature`. If `CQL_FILTER` is absent or empty, any filter Multiselect previously applied is removed and the layer's original configured `filter` (if any) is restored.
+
+Example:
+```javascript
+const msConfig = {
+  WMSHandling: { source: 'WMS' },
+  alternativeLayers: [
+    {
+      name: 'buildings_wms',
+      queryInfoLayers: ['buildings_wfs_query']
+    }
+  ]
+};
+```
+
+### CQL filters on WMS layers
+
+WMS filters in Origo belong in layer config `sourceParams.CQL_FILTER` (or runtime `layer.getSource().updateParams({ CQL_FILTER })`). They are **not** the top-level Origo `filter` option (that path is for WFS).
+
+Multiselect honors WMS `CQL_FILTER` as follows:
+
+| Path | Behavior |
+|------|----------|
+| `WMSHandling.source === 'WMS'` | GetFeatureInfo URL inherits source params, including `CQL_FILTER`. |
+| `alternativeLayers` + `queryInfoLayers` | Copies `CQL_FILTER` → query layer `filter` (or clears it when absent). |
+| Legacy WMS→WFS (default) | Syncs `CQL_FILTER` onto the WMS layer's `filter` before `Origo.getFeature`. |
+
+### Using with ek-filter-plugin
+
+[ek-filter-plugin](https://github.com/Eskilstuna-kommun/ek-filter-plugin) (`Origofilteretuna`) writes WMS filters via `updateParams({ CQL_FILTER })` and WFS filters via `layer.set('cqlFilter', …)` plus client feature replacement (`strategy: "all"` required for WFS).
+
+Recommended when both plugins are used:
+
+- **WMS:** prefer `WMSHandling: { source: 'WMS' }`, or `alternativeLayers` with a dedicated hidden WFS query layer.
+- **WFS:** keep `strategy: "all"` so Multiselect selects from the already-filtered client features. Multiselect also maps `cqlFilter` → Origo `filter` when a server refetch is needed (bbox strategy).
+- Thematic legend and ek-filter both write `CQL_FILTER` on WMS; last writer wins.
+
 ## Known limitations
 
 - Only WFS and AGS Feature layers are "fully" supported
-- WMS layers are supported if there is a WFS endpoint at the same URL as the WMS source. 
+- WMS layers are supported if there is a WFS endpoint at the same URL as the WMS source, or via `WMSHandling` / `alternativeLayers` (see above).
 - WMS layers must have same default SRS as the map
 - WFS layers must have the same default SRS as the map if using bbox strategy and a layerConfiguration that uses the layer property.
-- When using the default All visible configuration and WFS layers are using bbox strategy and and selecting with a larger object than visible on the screen (e.g. using a big buffer), objects outside the screen are not selected if they haven't been read before in another extent. 
-
+- When using the default All visible configuration and WFS layers are using bbox strategy and and selecting with a larger object than visible on the screen (e.g. using a big buffer), objects outside the screen are not selected if they haven't been read before in another extent.
+- CQL bridging is GeoServer-oriented (`CQL_FILTER`); QGIS `FILTER` / ArcGIS layer defs are not mirrored.

@@ -285,13 +285,102 @@ const Multiselect = function Multiselect(options = {}) {
   }
 
   /**
+   * Original Origo `filter` values before Multiselect applies a runtime query filter.
+   * Restored when runtime CQL / ek-filter cqlFilter is cleared so configured WFS filters
+   * (e.g. on alternativeLayers query targets) are not lost.
+   */
+  const originalFilterByLayer = new WeakMap();
+
+  /**
+   * Remember the layer's filter once, before Multiselect mutates it.
+   * @param {any} layer
+   */
+  function stashOriginalFilter(layer) {
+    if (!originalFilterByLayer.has(layer)) {
+      originalFilterByLayer.set(layer, layer.get('filter') || null);
+    }
+  }
+
+  /**
+   * Apply a runtime query filter for Origo.getFeature, or restore the stashed original
+   * when runtimeFilter is empty.
+   * @param {any} layer
+   * @param {string|null} runtimeFilter
+   */
+  function applyQueryFilter(layer, runtimeFilter) {
+    stashOriginalFilter(layer);
+    if (runtimeFilter) {
+      layer.set('filter', runtimeFilter);
+      return;
+    }
+    const original = originalFilterByLayer.get(layer);
+    if (original) {
+      layer.set('filter', original);
+    } else {
+      layer.unset('filter');
+    }
+  }
+
+  /**
+   * Read GeoServer CQL_FILTER from a WMS layer source params, if present and non-empty.
+   * @param {any} layer
+   * @returns {string|null}
+   */
+  function getCqlFilterFromWmsParams(layer) {
+    const source = layer.getSource && layer.getSource();
+    if (!source || !source.getParams) {
+      return null;
+    }
+    const params = source.getParams();
+    if (Object.hasOwn(params, 'CQL_FILTER') && params.CQL_FILTER) {
+      return params.CQL_FILTER;
+    }
+    return null;
+  }
+
+  /**
+   * Resolve the effective runtime query filter once, at the server-query boundary.
+   * Priority: explicit WMS source layer CQL → own WMS CQL_FILTER → ek-filter cqlFilter.
+   * @param {any} layer Layer that will be queried
+   * @param {any} [wmsSourceLayer] When set (alternativeLayers), WMS CQL from this layer wins
+   * @returns {string|null|undefined} string/null to apply/restore; undefined to leave layer.filter alone
+   */
+  function resolveRuntimeQueryFilter(layer, wmsSourceLayer) {
+    // alternativeLayers bridge: always honor the display WMS filter (or restore when cleared)
+    if (wmsSourceLayer) {
+      return getCqlFilterFromWmsParams(wmsSourceLayer);
+    }
+
+    const source = layer.getSource && layer.getSource();
+    if (source && source.getParams) {
+      const params = source.getParams();
+      if (Object.hasOwn(params, 'CQL_FILTER')) {
+        return params.CQL_FILTER || null;
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(layer.getProperties(), 'cqlFilter')) {
+      return layer.get('cqlFilter') || null;
+    }
+
+    return undefined;
+  }
+
+  /**
    * Helper to fectch features from a layer. Currently it does not support that the layer has another projection than the map,
    * but Origo is to blame here.
    * @param {any} layer
    * @param {any} extent
+   * @param {any} [wmsSourceLayer] Optional WMS layer whose CQL_FILTER should drive the query filter
    * @return {feature[]} array of features
    */
-  async function fetchFeaturesFromServer(layer, extent) {
+  async function fetchFeaturesFromServer(layer, extent, wmsSourceLayer) {
+    // Origo.getFeature reads layer.get('filter'). Resolve the effective runtime filter once
+    // here so alternativeLayers WMS CQL is not overwritten by a later ek-filter sync.
+    const runtimeFilter = resolveRuntimeQueryFilter(layer, wmsSourceLayer);
+    if (runtimeFilter !== undefined) {
+      applyQueryFilter(layer, runtimeFilter);
+    }
     const fetchedFeatures = await Origo.getFeature(null, layer, viewer.getMapSource(), viewer.getProjectionCode(), viewer.getProjection(), extent).catch((err) => {
       console.error(`Unable to query layer ${layer.get('title')} (${layer.get('name')})`);
       throw err;
@@ -305,9 +394,10 @@ const Multiselect = function Multiselect(options = {}) {
    * @param {any} extent
    * @param {any} selectionGroup
    * @param {any} selectionGroupTitle
+   * @param {any} [wmsSourceLayer] Optional WMS layer whose CQL_FILTER should drive the query filter
    */
-  async function getRemoteItems(layer, extent, selectionGroup, selectionGroupTitle) {
-    const features = await fetchFeaturesFromServer(layer, extent);
+  async function getRemoteItems(layer, extent, selectionGroup, selectionGroupTitle, wmsSourceLayer) {
+    const features = await fetchFeaturesFromServer(layer, extent, wmsSourceLayer);
     if (features) {
       const selectedRemoteItems = features.map((feature) => new Origo.SelectedItem(feature, layer, map, selectionGroup, selectionGroupTitle));
       return selectedRemoteItems;
@@ -344,21 +434,14 @@ const Multiselect = function Multiselect(options = {}) {
           const qiLayer = viewer.getLayer(layerName);
           // Try to use same filter on queryInfoLayer as the original layer. Probably only works for simple filters on same type of server when
           // original layer is WMS and query layer is WFS, which happens to be the problem we're solving.
-          // getParams only exists on WMS layers
-          if (layer.getSource().getParams && !currLayerConfig.disableFilterHandling) {
-            const params = layer.getSource().getParams();
-            // TODO: get param name from layer's source "type", itroduced in 1407
-            //       Awaits that the getSourceType utility function is exposed in api. Right now it is hidden inside print-resize.js
-            // If the WMS layer has a filter, use the same filter on th WFS layer which is queried.
-            if (Object.hasOwn(params, 'CQL_FILTER')) {
-              // Origo.getFeature() reads the filter param for each call. If changing to WFSSource, the source option must be changed (which is "private")
-              // Ideally wfs layer should have a listener and update source as well to keep it in sync
-              // Note that this changes the filter on the layer itself permanently. Which makes it only useful when using a non visible layer
-              // for this purpose only.
-              qiLayer.set('filter', params.CQL_FILTER);
-            }
-          }
-          promises.push(getRemoteItems(qiLayer, extent, selectionGroup, selectionGroupTitle));
+          // Effective CQL is resolved once inside fetchFeaturesFromServer (WMS source CQL wins over
+          // any cqlFilter on the query layer). Prefer a non-visible dedicated query layer.
+          // TODO: get param name from layer's source "type", itroduced in 1407
+          //       Awaits that the getSourceType utility function is exposed in api. Right now it is hidden inside print-resize.js
+          const wmsSourceLayer = (layer.getSource().getParams && !currLayerConfig.disableFilterHandling)
+            ? layer
+            : undefined;
+          promises.push(getRemoteItems(qiLayer, extent, selectionGroup, selectionGroupTitle, wmsSourceLayer));
         });
         try {
           const remoteitems = await Promise.all(promises);
@@ -374,7 +457,10 @@ const Multiselect = function Multiselect(options = {}) {
       // Basically here we get all vector features from client.
       if (currentLayerConfig.layers && layer.get('type') === 'WFS' && layer.get('strategy') !== 'all') {
         // If Wfs is using bbox, the features may not have beeen fetched if layer is not visisble or features are out of view.
-        // Fetch all intersecting features and add to layer. Then carry on as usual
+        // Fetch all intersecting features and add to layer. Then carry on as usual.
+        // fetchFeaturesFromServer resolves ek-filter cqlFilter (and WMS CQL when relevant) once
+        // at the query boundary. When strategy is "all" (ek-filter's supported mode) this
+        // block is skipped and selection uses the already-filtered client features.
         const serverFeatures = await fetchFeaturesFromServer(layer, extent);
         layer.getSource().addFeatures(serverFeatures);
       }
@@ -435,6 +521,7 @@ const Multiselect = function Multiselect(options = {}) {
         // It works for geoserver, but technically it is wrong as there is no WFS layer defined in origo.
         // If implementation of origo.getFeature changes, it may break.
         // It is only implemented as it was the default implementation from the start and left for backwards compatibility.
+        // CQL_FILTER from WMS source params is applied once inside fetchFeaturesFromServer.
         const remoteItems = await getRemoteItems(layer, extent, selectionGroup, selectionGroupTitle);
         // Can't have both local and remote in same layer, so this is safe.
         selectedItems = remoteItems || [];
